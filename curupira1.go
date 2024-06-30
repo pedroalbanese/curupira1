@@ -73,7 +73,7 @@ func (this *curupira1Cipher) Decrypt(dst, src []byte) {
         panic("curupira1: output not full block")
     }
 
-    if alias.InexactOverlap(dst[:BlockSize], src[:BlockSize]) {
+    if subtle.InexactOverlap(dst[:BlockSize], src[:BlockSize]) {
         panic("curupira1: invalid buffer overlap")
     }
 
