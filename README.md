@@ -9,3 +9,4 @@ $$
 \text{Curupira}[K] \equiv \sigma[\kappa(R)] \circ \pi \circ \gamma \circ \left( \prod_{r=1}^{R-1} \sigma[\kappa(r)] \circ \theta \circ \pi \circ \gamma \right) \circ \sigma[\kappa(0)]
 $$
 
+Visit: [go-cryptobin](github.com/deatil/go-cryptobin)
