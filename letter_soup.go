@@ -92,8 +92,6 @@ func (this *LetterSoup) Encrypt(dst, src []byte) {
 
 func (this *LetterSoup) Decrypt(dst, src []byte) {
     this.LFSRC(src, dst)
-    
-    this.mac.Update(dst)
 }
 
 func (this *LetterSoup) GetTag(tag []byte, tagBits int) []byte {
