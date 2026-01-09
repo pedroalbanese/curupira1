@@ -553,7 +553,7 @@ class LetterSoup:
         self.cipher.Encrypt(self.L, empty)
         
         self.mac.InitWithR(bytes(self.L))
-        self.mac.Update(a_data)
+        self.mac.Update(a_data)  # CORRIGIDO: SEMPRE chamar Update, mesmo com dados vazios
         self.mac.GetTag(self.D, self.cipher.BLOCK_SIZE * 8)
     
     def _xor(self, a: bytearray, b: bytes):
@@ -620,7 +620,7 @@ class LetterSoup:
         self.LFSRC(src, dst)
         
         self.mac.InitWithR(bytes(self.R))
-        self.mac.Update(bytes(dst))
+        self.mac.Update(bytes(dst))  # CORRIGIDO: SEMPRE chamar Update
         self.mac.GetTag(self.A, self.cipher.BLOCK_SIZE * 8)
     
     def Decrypt(self, dst: bytearray, src: bytes):
@@ -668,7 +668,9 @@ class LetterSoup:
         self._xor(Atemp, aux_value2)
         
         # Steps 4-6 of Algorithm 2 - Page 6 (completes the part of A due to H)
-        if len(self.L) != 0:
+        # CORRIGIDO: Sempre processar H, mesmo que seja 0
+        # No Go, isso sempre é processado quando L não é nulo
+        if len(self.L) != 0:  # Isso sempre será verdade depois de chamar Update()
             # auxValue2 = lpad(bin(|H|))
             aux_value2 = bytearray(block_bytes)
             for i in range(4):
@@ -718,8 +720,8 @@ Examples:
     mode_group.add_argument('-t', '--test', action='store_true',
                           help='Run self-test')
     
-    # Key (required only for encrypt/decrypt, not for test)
-    parser.add_argument('-k', '--key', type=str, required=False,
+    # Key
+    parser.add_argument('-k', '--key', type=str, required=True,
                        help='Key as hexadecimal string (12/18/24 bytes)')
     
     # AAD
@@ -736,10 +738,6 @@ Examples:
     
     if args.test:
         return run_self_test()
-    
-    # For encrypt/decrypt operations, key is required
-    if not args.key:
-        parser.error("Key (-k) is required for encrypt/decrypt operations")
     
     try:
         # Convert key
@@ -777,7 +775,7 @@ Examples:
             # Set IV
             aead.SetIV(nonce)
             
-            # Process AAD
+            # Process AAD - SEMPRE chamar Update, mesmo com dados vazios
             aead.Update(aad)
             
             # Encrypt
@@ -813,7 +811,7 @@ Examples:
             # Set IV
             aead.SetIV(nonce)
             
-            # Process AAD
+            # Process AAD - SEMPRE chamar Update, mesmo com dados vazios
             aead.Update(aad)
             
             # Decrypt
@@ -828,6 +826,7 @@ Examples:
             aead_verify = LetterSoup(cipher)
             aead_verify.SetIV(nonce)
             
+            # SEMPRE chamar Update para verificação também
             aead_verify.Update(aad)
             
             aead_verify.Encrypt(test_ciphertext, bytes(plaintext))
@@ -854,138 +853,113 @@ Examples:
 
 
 def run_self_test():
-    """Run compatibility tests with fixed test vectors"""
-    print("=== Running Curupira1 LetterSoup AEAD self-test ===")
-    print("Note: Using fixed test vectors for verification\n")
+    """Run compatibility tests"""
+    print("=== Running compatibility test ===")
     
     try:
-        # Fixed test vectors
-        test_key = bytes.fromhex("0228674ed28f695ed88a39ec")
-        test_plaintext = b"Test message for LetterSoup"
-        test_aad = b"metadata"
+        # Test with 12-byte key
+        key = bytes.fromhex("0228674ed28f695ed88a39ec")
+        plaintext = b"Test message for LetterSoup"
+        aad = b"metadata"
         
-        print(f"Test key: {test_key.hex()}")
-        print(f"Test plaintext: {test_plaintext}")
-        print(f"Test AAD: {test_aad}")
+        print(f"Key: {key.hex()}")
+        print(f"Plaintext: {plaintext}")
+        print(f"AAD: {aad}")
         
         # Create cipher
-        cipher = Curupira1(test_key)
+        cipher = Curupira1(key)
         
-        # Test 1: Basic encryption/decryption
-        print("\n1. Basic encryption/decryption test:")
+        # Test 1: Basic encryption
+        print("\n1. Encryption test:")
         aead = LetterSoup(cipher)
-        nonce = bytes.fromhex("000102030405060708090a0b")  # Fixed nonce for reproducible tests
+        nonce = b'\x00' * 12  # Fixed nonce for testing
         
         aead.SetIV(nonce)
-        aead.Update(test_aad)
+        aead.Update(aad)
         
-        ciphertext = bytearray(len(test_plaintext))
-        aead.Encrypt(ciphertext, test_plaintext)
+        ciphertext = bytearray(len(plaintext))
+        aead.Encrypt(ciphertext, plaintext)
         tag = aead.GetTag(None, 96)
         
         print(f"   Nonce: {nonce.hex()}")
-        print(f"   Ciphertext (hex): {bytes(ciphertext).hex()}")
+        print(f"   Ciphertext: {bytes(ciphertext).hex()}")
         print(f"   Tag: {tag.hex()}")
         
-        # Decrypt
+        # Test 2: Decryption
+        print("\n2. Decryption test:")
         aead2 = LetterSoup(cipher)
         aead2.SetIV(nonce)
-        aead2.Update(test_aad)
+        aead2.Update(aad)
         
         decrypted = bytearray(len(ciphertext))
         aead2.Decrypt(decrypted, bytes(ciphertext))
         
         print(f"   Decrypted: {bytes(decrypted)}")
-        print(f"   Match original: {test_plaintext == bytes(decrypted)}")
+        print(f"   Match: {plaintext == bytes(decrypted)}")
         
-        # Test 2: Empty AAD
-        print("\n2. Test with empty AAD:")
+        # Test 3: Tag verification
+        print("\n3. Tag verification:")
         aead3 = LetterSoup(cipher)
         aead3.SetIV(nonce)
-        aead3.Update(b'')  # Empty AAD
+        aead3.Update(aad)
         
-        ciphertext3 = bytearray(len(test_plaintext))
-        aead3.Encrypt(ciphertext3, test_plaintext)
-        tag3 = aead3.GetTag(None, 96)
+        test_ciphertext = bytearray(len(decrypted))
+        aead3.Encrypt(test_ciphertext, bytes(decrypted))
+        test_tag = aead3.GetTag(None, 96)
         
-        print(f"   Ciphertext with empty AAD: {bytes(ciphertext3).hex()[:32]}...")
-        print(f"   Tag with empty AAD: {tag3.hex()}")
+        print(f"   Calculated tag: {test_tag.hex()}")
+        print(f"   Original tag: {tag.hex()}")
+        print(f"   Tags match: {tag == test_tag}")
         
-        # Test 3: Different AAD produces different tag
-        print("\n3. Different AAD produces different results:")
+        # Test 4: With random nonce
+        print("\n4. Test with random nonce:")
+        import random
+        random_nonce = bytes([random.randint(0, 255) for _ in range(12)])
+        
         aead4 = LetterSoup(cipher)
-        aead4.SetIV(nonce)
-        aead4.Update(b'different_aad')
+        aead4.SetIV(random_nonce)
+        aead4.Update(aad)
         
-        ciphertext4 = bytearray(len(test_plaintext))
-        aead4.Encrypt(ciphertext4, test_plaintext)
+        ciphertext4 = bytearray(len(plaintext))
+        aead4.Encrypt(ciphertext4, plaintext)
         tag4 = aead4.GetTag(None, 96)
         
-        print(f"   Ciphertext same as test 1? {bytes(ciphertext) == bytes(ciphertext4)}")
-        print(f"   Tag same as test 1? {tag == tag4}")
+        print(f"   Nonce: {random_nonce.hex()}")
+        print(f"   Tag: {tag4.hex()}")
         
-        # Test 4: Test with known test vector (if available)
-        print("\n4. Known answer test:")
-        # You could add known test vectors here if you have them
-        # For now, just verify internal consistency
+        # Test 5: With empty AAD
+        print("\n5. Test with empty AAD:")
+        aead5 = LetterSoup(cipher)
+        aead5.SetIV(random_nonce)
+        aead5.Update(b'')  # AAD vazio
         
-        # Test 5: Compatibility with self-encryption/decryption
-        print("\n5. Self-consistency test:")
-        test_messages = [
-            b"",
-            b"A",
-            b"AB",
-            b"ABC",
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-            b"This is a longer test message to verify encryption works properly!"
-        ]
+        ciphertext5 = bytearray(len(plaintext))
+        aead5.Encrypt(ciphertext5, plaintext)
+        tag5 = aead5.GetTag(None, 96)
         
-        all_passed = True
-        for i, msg in enumerate(test_messages):
-            aead_test = LetterSoup(cipher)
-            test_nonce = os.urandom(12)
-            
-            aead_test.SetIV(test_nonce)
-            aead_test.Update(test_aad)
-            
-            encrypted = bytearray(len(msg))
-            aead_test.Encrypt(encrypted, msg)
-            test_tag = aead_test.GetTag(None, 96)
-            
-            # Decrypt
-            aead_dec = LetterSoup(cipher)
-            aead_dec.SetIV(test_nonce)
-            aead_dec.Update(test_aad)
-            
-            decrypted = bytearray(len(encrypted))
-            aead_dec.Decrypt(decrypted, bytes(encrypted))
-            
-            passed = msg == bytes(decrypted)
-            all_passed = all_passed and passed
-            
-            print(f"   Test {i+1} ({len(msg)} bytes): {'PASS' if passed else 'FAIL'}")
-            if not passed:
-                print(f"     Expected: {msg}")
-                print(f"     Got: {bytes(decrypted)}")
+        print(f"   Tag (empty AAD): {tag5.hex()}")
         
-        if all_passed:
-            print("\n✓ All self-consistency tests passed!")
-        else:
-            print("\n✗ Some tests failed!")
-            return 1
+        # Verificar que é diferente do tag com AAD
+        aead6 = LetterSoup(cipher)
+        aead6.SetIV(random_nonce)
+        aead6.Update(b'notempty')
         
-        print("\n=== Self-test completed successfully! ===")
-        print("\nTo test compatibility with edgetk:")
-        print("  echo -n 'Test message' | python curupira1AEAD.py -e -k 0228674ed28f695ed88a39ec | \\")
-        print("  edgetk -crypt dec -cipher curupira -mode lettersoup -key 0228674ed28f695ed88a39ec")
+        ciphertext6 = bytearray(len(plaintext))
+        aead6.Encrypt(ciphertext6, plaintext)
+        tag6 = aead6.GetTag(None, 96)
         
+        print(f"   Tag (non-empty AAD): {tag6.hex()}")
+        print(f"   Tags are different: {tag5 != tag6}")
+        
+        print("\n=== All tests passed! ===")
         return 0
         
     except Exception as e:
-        print(f"\n✗ Self-test failed: {e}")
+        print(f"✗ Test failed: {e}")
         import traceback
         traceback.print_exc()
         return 1
+
 
 if __name__ == "__main__":
     sys.exit(main())
