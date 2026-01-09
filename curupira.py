@@ -1,0 +1,965 @@
+#!/usr/bin/env python3
+import struct
+from typing import List, Optional, Tuple
+import os
+import sys
+import argparse
+
+class KeySizeError(Exception):
+    def __init__(self, size: int):
+        self.size = size
+        super().__init__(f"curupira1: invalid key size {size}")
+
+class Curupira1:
+    BLOCK_SIZE = 12
+    
+    def __init__(self, key: bytes):
+        self.key = key
+        self.key_size = len(key)
+        
+        if self.key_size not in [12, 18, 24]:
+            raise KeySizeError(self.key_size)
+        
+        # Initialize tables
+        self._init_xtimes_table()
+        self._init_sbox_table()
+        
+        # Expand key
+        self._expand_key()
+    
+    def _init_xtimes_table(self):
+        """Initialize xTimes table (multiplication by 2 in GF(2^8))"""
+        self.xtimes_table = [0] * 256
+        for u in range(256):
+            d = u << 1
+            if d >= 0x100:
+                d = d ^ 0x14D
+            self.xtimes_table[u] = d & 0xFF
+    
+    def _init_sbox_table(self):
+        """Initialize S-Box table according to Curupira algorithm"""
+        P = [0x3, 0xF, 0xE, 0x0, 0x5, 0x4, 0xB, 0xC,
+             0xD, 0xA, 0x9, 0x6, 0x7, 0x8, 0x2, 0x1]
+        Q = [0x9, 0xE, 0x5, 0x6, 0xA, 0x2, 0x3, 0xC,
+             0xF, 0x0, 0x4, 0xD, 0x7, 0xB, 0x1, 0x8]
+        
+        self.sbox_table = [0] * 256
+        
+        for u in range(256):
+            uh1 = P[(u >> 4) & 0xF]
+            ul1 = Q[u & 0xF]
+            uh2 = Q[((uh1 & 0xC) ^ ((ul1 >> 2) & 0x3)) & 0xF]
+            ul2 = P[(((uh1 << 2) & 0xC) ^ (ul1 & 0x3)) & 0xF]
+            uh1 = P[((uh2 & 0xC) ^ ((ul2 >> 2) & 0x3)) & 0xF]
+            ul1 = Q[(((uh2 << 2) & 0xC) ^ (ul2 & 0x3)) & 0xF]
+            
+            self.sbox_table[u] = ((uh1 << 4) ^ ul1) & 0xFF
+    
+    def xtimes(self, u: int) -> int:
+        """Multiplication by 2 in GF(2^8)"""
+        return self.xtimes_table[u & 0xFF]
+    
+    def ctimes(self, u: int) -> int:
+        """cTimes transformation as per specification"""
+        # c(u) = x(x(x(x(u) ⊕ u) ⊕ u))
+        return self.xtimes(
+            self.xtimes(
+                self.xtimes(
+                    self.xtimes(u) ^ u
+                ) ^ u
+            )
+        )
+    
+    def sbox(self, u: int) -> int:
+        """Apply S-Box"""
+        return self.sbox_table[u & 0xFF]
+    
+    def _dtimesa(self, a: List[int], j: int, b: List[int]):
+        """dTimes transformation for linear diffusion layer"""
+        d = 3 * j  # Column delta
+        v = self.xtimes(a[0 + d] ^ a[1 + d] ^ a[2 + d])
+        w = self.xtimes(v)
+        
+        b[0 + d] = a[0 + d] ^ v
+        b[1 + d] = a[1 + d] ^ w
+        b[2 + d] = a[2 + d] ^ v ^ w
+    
+    def _etimesa(self, a: List[int], j: int, b: List[int], e: bool):
+        """eTimes transformation for key expansion"""
+        d = 3 * j  # Column delta
+        v = a[0 + d] ^ a[1 + d] ^ a[2 + d]
+        
+        if e:
+            v = self.ctimes(v)
+        else:
+            v = self.ctimes(v) ^ v
+        
+        b[0 + d] = a[0 + d] ^ v
+        b[1 + d] = a[1 + d] ^ v
+        b[2 + d] = a[2 + d] ^ v
+    
+    def _apply_nonlinear_layer(self, a: List[int]) -> List[int]:
+        """Apply nonlinear layer (S-Box)"""
+        return [self.sbox(x) for x in a]
+    
+    def _apply_permutation_layer(self, a: List[int]) -> List[int]:
+        """Apply permutation layer"""
+        b = [0] * 12
+        
+        for i in range(3):
+            for j in range(4):
+                b[i + 3 * j] = a[i + 3 * (i ^ j)]
+        
+        return b
+    
+    def _apply_linear_diffusion_layer(self, a: List[int]) -> List[int]:
+        """Apply linear diffusion layer"""
+        b = [0] * 12
+        
+        for j in range(4):
+            self._dtimesa(a, j, b)
+        
+        return b
+    
+    def _apply_key_addition(self, a: List[int], kr: List[int]) -> List[int]:
+        """Key addition (XOR)"""
+        return [a[i] ^ kr[i] for i in range(12)]
+    
+    def _calculate_schedule_constant(self, s: int, key_bits: int) -> List[int]:
+        """Calculate constant for key expansion"""
+        t = key_bits // 48
+        q = [0] * (3 * 2 * t)
+        
+        if s == 0:
+            return q
+        
+        # For i = 0
+        for j in range(2 * t):
+            q[3 * j] = self.sbox(2 * t * (s - 1) + j)
+        
+        # For i > 0 (already zeros by default)
+        return q
+    
+    def _apply_constant_addition(self, Kr: List[int], subkey_rank: int, 
+                                 key_bits: int, t: int) -> List[int]:
+        """Constant addition in key expansion"""
+        b = Kr.copy()
+        q = self._calculate_schedule_constant(subkey_rank, key_bits)
+        
+        for i in range(3):
+            for j in range(2 * t):
+                idx = i + 3 * j
+                b[idx] ^= q[idx]
+        
+        return b
+    
+    def _apply_cyclic_shift(self, a: List[int], t: int) -> List[int]:
+        """Apply cyclic shift in key expansion"""
+        length = 3 * 2 * t
+        b = [0] * length
+        
+        for j in range(2 * t):
+            # For i = 0
+            b[3 * j] = a[3 * j]
+            
+            # For i = 1
+            b[1 + 3 * j] = a[1 + 3 * ((j + 1) % (2 * t))]
+            
+            # For i = 2
+            if j > 0:
+                b[2 + 3 * j] = a[2 + 3 * ((j - 1) % (2 * t))]
+            else:
+                b[2] = a[2 + 3 * (2 * t - 1)]
+        
+        return b
+    
+    def _apply_linear_diffusion(self, a: List[int], t: int) -> List[int]:
+        """Apply linear diffusion in key expansion"""
+        length = 3 * 2 * t
+        b = [0] * length
+        
+        for j in range(2 * t):
+            self._etimesa(a, j, b, True)
+        
+        return b
+    
+    def _calculate_next_subkey(self, Kr: List[int], subkey_rank: int,
+                              key_bits: int, t: int) -> List[int]:
+        """Calculate next subkey"""
+        return self._apply_linear_diffusion(
+            self._apply_cyclic_shift(
+                self._apply_constant_addition(Kr, subkey_rank, key_bits, t),
+                t
+            ),
+            t
+        )
+    
+    def _select_round_key(self, Kr: List[int]) -> List[int]:
+        """Select round key"""
+        kr = [0] * 12
+        
+        # For i = 0
+        for j in range(4):
+            kr[3 * j] = self.sbox(Kr[3 * j])
+        
+        # For i > 0
+        for i in range(1, 3):
+            for j in range(4):
+                kr[i + 3 * j] = Kr[i + 3 * j]
+        
+        return kr
+    
+    def _expand_key(self):
+        """Expand key and generate encryption and decryption subkeys"""
+        key_bits = self.key_size * 8
+        
+        # Determine number of rounds R
+        if key_bits == 96:
+            self.R = 10
+        elif key_bits == 144:
+            self.R = 14
+        elif key_bits == 192:
+            self.R = 18
+        
+        self.key_bits = key_bits
+        self.t = key_bits // 48
+        
+        # Convert key to integer list
+        Kr = list(self.key)
+        
+        # Generate round keys
+        self.encryption_round_keys = [None] * (self.R + 1)
+        self.decryption_round_keys = [None] * (self.R + 1)
+        
+        # First subkey
+        kr = self._select_round_key(Kr)
+        self.encryption_round_keys[0] = kr
+        
+        # Generate remaining subkeys
+        for r in range(1, self.R + 1):
+            Kr = self._calculate_next_subkey(Kr, r, self.key_bits, self.t)
+            kr = self._select_round_key(Kr)
+            
+            self.encryption_round_keys[r] = kr
+            self.decryption_round_keys[self.R - r] = self._apply_linear_diffusion_layer(kr)
+        
+        # Last keys
+        self.decryption_round_keys[0] = self.encryption_round_keys[self.R]
+        self.decryption_round_keys[self.R] = self.encryption_round_keys[0]
+    
+    def _perform_whitening_round(self, a: List[int], k0: List[int]) -> List[int]:
+        """Whitening round (only key addition)"""
+        return self._apply_key_addition(a, k0)
+    
+    def _perform_last_round(self, a: List[int], kR: List[int]) -> List[int]:
+        """Last round (without linear diffusion)"""
+        return self._apply_key_addition(
+            self._apply_permutation_layer(
+                self._apply_nonlinear_layer(a)
+            ),
+            kR
+        )
+    
+    def _perform_round(self, a: List[int], kr: List[int]) -> List[int]:
+        """Normal round"""
+        return self._apply_key_addition(
+            self._apply_linear_diffusion_layer(
+                self._apply_permutation_layer(
+                    self._apply_nonlinear_layer(a)
+                )
+            ),
+            kr
+        )
+    
+    def _process_block(self, data: bytes, round_keys: List[List[int]]) -> bytes:
+        """Process a block of data"""
+        # Convert to integer list
+        tmp = list(data)
+        
+        # Whitening round
+        tmp = self._perform_whitening_round(tmp, round_keys[0])
+        
+        # Normal rounds
+        for r in range(1, self.R):
+            tmp = self._perform_round(tmp, round_keys[r])
+        
+        # Last round
+        tmp = self._perform_last_round(tmp, round_keys[self.R])
+        
+        # Convert back to bytes
+        return bytes(tmp)
+    
+    def encrypt(self, plaintext: bytes) -> bytes:
+        """Encrypt a block of 12 bytes"""
+        if len(plaintext) != self.BLOCK_SIZE:
+            raise ValueError(f"Plaintext must be {self.BLOCK_SIZE} bytes")
+        
+        return self._process_block(plaintext, self.encryption_round_keys)
+    
+    def decrypt(self, ciphertext: bytes) -> bytes:
+        """Decrypt a block of 12 bytes"""
+        if len(ciphertext) != self.BLOCK_SIZE:
+            raise ValueError(f"Ciphertext must be {self.BLOCK_SIZE} bytes")
+        
+        return self._process_block(ciphertext, self.decryption_round_keys)
+    
+    def sct(self, data: bytes) -> bytes:
+        """Square-Complete Transform (4 rounds without key)"""
+        if len(data) != self.BLOCK_SIZE:
+            raise ValueError(f"Data must be {self.BLOCK_SIZE} bytes")
+        
+        tmp = list(data)
+        
+        def _unkeyed_round(a: List[int]) -> List[int]:
+            return self._apply_linear_diffusion_layer(
+                self._apply_permutation_layer(
+                    self._apply_nonlinear_layer(a)
+                )
+            )
+        
+        # 4 rounds without key
+        tmp = _unkeyed_round(tmp)
+        for _ in range(3):
+            tmp = _unkeyed_round(tmp)
+        
+        return bytes(tmp)
+    
+    # Go-compatible methods
+    def Encrypt(self, dst: bytearray, src: bytes):
+        """Encrypt like Go: Encrypt(dst, src)"""
+        if len(src) != self.BLOCK_SIZE:
+            raise ValueError(f"Source must be {self.BLOCK_SIZE} bytes")
+        
+        result = self.encrypt(src)
+        dst[:len(result)] = result
+    
+    def Decrypt(self, dst: bytearray, src: bytes):
+        """Decrypt like Go: Decrypt(dst, src)"""
+        if len(src) != self.BLOCK_SIZE:
+            raise ValueError(f"Source must be {self.BLOCK_SIZE} bytes")
+        
+        result = self.decrypt(src)
+        dst[:len(result)] = result
+    
+    def Sct(self, dst: bytearray, src: bytes):
+        """SCT like Go: Sct(dst, src)"""
+        if len(src) != self.BLOCK_SIZE:
+            raise ValueError(f"Source must be {self.BLOCK_SIZE} bytes")
+        
+        result = self.sct(src)
+        dst[:len(result)] = result
+    
+    def BlockSize(self) -> int:
+        """Block size like Go"""
+        return self.BLOCK_SIZE
+
+
+class Marvin:
+    """Marvin MAC implementation compatible with Go"""
+    C = 0x2A  # Constant c
+    
+    def __init__(self, cipher: Curupira1, R: Optional[bytes] = None, letter_soup_mode: bool = False):
+        self.cipher = cipher
+        self.block_bytes = cipher.BLOCK_SIZE
+        self.letter_soup_mode = letter_soup_mode
+        
+        if R is not None:
+            self.InitWithR(R)
+        else:
+            self.Init()
+    
+    def _xor(self, a: bytearray, b: bytes) -> None:
+        """XOR in-place between bytearray and bytes"""
+        for i in range(min(len(a), len(b))):
+            a[i] ^= b[i]
+    
+    def Init(self):
+        """Step 2 of Algorithm 1 - Page 4"""
+        self.buffer = bytearray(self.block_bytes)
+        self.R = bytearray(self.block_bytes)
+        self.O = bytearray(self.block_bytes)
+        
+        # Step 2 of Algorithm 1 - Page 4
+        left_padded_c = bytearray(self.block_bytes)
+        left_padded_c[self.block_bytes - 1] = self.C
+        
+        encrypted = self.cipher.encrypt(bytes(left_padded_c))
+        self.R[:] = encrypted
+        self._xor(self.R, left_padded_c)
+        self.O[:] = self.R[:]
+    
+    def InitWithR(self, R: bytes):
+        """Initialize with provided R"""
+        self.buffer = bytearray(self.block_bytes)
+        self.R = bytearray(self.block_bytes)
+        self.O = bytearray(self.block_bytes)
+        
+        self.R[:] = R[:self.block_bytes]
+        self.O[:] = R[:self.block_bytes]
+    
+    def updateOffset(self):
+        """Algorithm 6 - Page 19 (w = 8, k1 = 11, k2 = 13, k3 = 16)"""
+        O0 = self.O[0]
+        
+        # Shift left (equivalent to copy(O[0:], O[1:12]) in Go)
+        for i in range(11):
+            self.O[i] = self.O[i + 1]
+        
+        # Note: In Go, operations are with uint8, so overflow is automatic
+        self.O[9] = (self.O[9] ^ O0 ^ (O0 >> 3) ^ (O0 >> 5)) & 0xFF
+        self.O[10] = (self.O[10] ^ ((O0 << 5) & 0xFF) ^ ((O0 << 3) & 0xFF)) & 0xFF
+        self.O[11] = O0
+    
+    def Update(self, a_data: bytes):
+        """Update MAC with associated data"""
+        a_length = len(a_data)
+        block_bytes = self.block_bytes
+        
+        M = bytearray(block_bytes)
+        A = bytearray(block_bytes)
+        
+        q = a_length // block_bytes
+        r = a_length % block_bytes
+        
+        # Steps 1, 3-5, 6-7 (only R) of Algorithm 1 - Page 4
+        self._xor(self.buffer, self.R)
+        
+        for i in range(q):
+            M[:] = a_data[i * block_bytes:(i + 1) * block_bytes]
+            self.updateOffset()
+            self._xor(M, self.O)
+            self.cipher.Sct(A, bytes(M))
+            self._xor(self.buffer, A)
+        
+        if r != 0:
+            M[:r] = a_data[q * block_bytes:q * block_bytes + r]
+            for i in range(r, block_bytes):
+                M[i] = 0
+            
+            self.updateOffset()
+            self._xor(M, self.O)
+            self.cipher.Sct(A, bytes(M))
+            self._xor(self.buffer, A)
+        
+        self.m_length = a_length
+    
+    def GetTag(self, tag: Optional[bytearray] = None, tag_bits: int = 96):
+        """Get MAC tag"""
+        if tag is None:
+            tag = bytearray(tag_bits // 8)
+        
+        block_bytes = self.block_bytes
+        
+        if self.letter_soup_mode:
+            tag[:block_bytes] = self.buffer[:block_bytes]
+            return bytes(tag[:tag_bits // 8])
+        
+        # Steps 6-9 of Algorithm 1 - Page 4
+        A = bytearray(block_bytes)
+        encrypted_a = bytearray(block_bytes)
+        aux_value1 = bytearray(block_bytes)
+        aux_value2 = bytearray(block_bytes)
+        
+        # auxValue1 = rpad(bin(n-tagBits)||1)
+        diff = self.cipher.BLOCK_SIZE * 8 - tag_bits
+        
+        if diff == 0:
+            aux_value1[0] = 0x80
+            aux_value1[1] = 0x00
+        elif diff < 0:
+            aux_value1[0] = diff & 0xFF
+            aux_value1[1] = 0x80
+        else:
+            diff = (diff << 1) | 0x01
+            # Go code does: for diff > 0 { diff = int8(diff << 1) }
+            # This is equivalent to shifting until the most significant bit is 1
+            while diff > 0 and (diff & 0x80) == 0:
+                diff = (diff << 1) & 0xFF
+            aux_value1[0] = diff & 0xFF
+            aux_value1[1] = 0x00
+        
+        # auxValue2 = lpad(bin(|M|))
+        processed_bits = 8 * self.m_length
+        for i in range(4):
+            aux_value2[block_bytes - i - 1] = (processed_bits >> (8 * i)) & 0xFF
+        
+        A[:] = self.buffer[:]
+        self._xor(A, aux_value1)
+        self._xor(A, aux_value2)
+        
+        self.cipher.Encrypt(encrypted_a, bytes(A))
+        
+        tag_bytes = tag_bits // 8
+        tag[:tag_bytes] = encrypted_a[:tag_bytes]
+        return bytes(tag[:tag_bytes])
+
+
+class LetterSoup:
+    """AEAD LetterSoup mode implementation exactly like in Go"""
+    
+    def __init__(self, cipher: Curupira1):
+        self.cipher = cipher
+        self.block_bytes = cipher.BLOCK_SIZE
+        self.mac = Marvin(cipher, None, True)
+        
+        self.m_length = 0
+        self.h_length = 0
+        self.iv = bytearray()
+        self.A = bytearray()
+        self.D = bytearray()
+        self.R = bytearray()
+        self.L = bytearray()
+    
+    def SetIV(self, iv: bytes):
+        """Set initialization vector"""
+        iv_length = len(iv)
+        block_bytes = self.block_bytes
+        
+        self.iv = bytearray(iv_length)
+        self.iv[:] = iv
+        
+        self.L = bytearray()
+        
+        # Step 2 of Algorithm 2 - Page 6
+        self.R = bytearray(block_bytes)
+        left_padded_n = bytearray(block_bytes)
+        
+        # copy(leftPaddedN[blockBytes - ivLength:], iv[:blockBytes])
+        start_idx = block_bytes - iv_length
+        if start_idx < 0:
+            start_idx = 0
+        copy_len = min(iv_length, block_bytes)
+        left_padded_n[start_idx:start_idx + copy_len] = iv[:copy_len]
+        
+        # this.cipher.Encrypt(this.R, leftPaddedN)
+        self.cipher.Encrypt(self.R, bytes(left_padded_n))
+        
+        # xor(this.R, leftPaddedN)
+        for i in range(block_bytes):
+            self.R[i] ^= left_padded_n[i]
+    
+    def Update(self, a_data: bytes):
+        """Update with associated data (AAD)"""
+        a_length = len(a_data)
+        block_bytes = self.block_bytes
+        
+        # Step 4 of Algorithm 2 - Page 6 (L and part of D)
+        self.L = bytearray(block_bytes)
+        self.D = bytearray(block_bytes)
+        
+        empty = bytes(block_bytes)
+        
+        self.h_length = a_length
+        self.cipher.Encrypt(self.L, empty)
+        
+        self.mac.InitWithR(bytes(self.L))
+        self.mac.Update(a_data)  # CORRIGIDO: SEMPRE chamar Update, mesmo com dados vazios
+        self.mac.GetTag(self.D, self.cipher.BLOCK_SIZE * 8)
+    
+    def _xor(self, a: bytearray, b: bytes):
+        """XOR in-place"""
+        for i in range(min(len(a), len(b))):
+            a[i] ^= b[i]
+    
+    def updateOffset(self, O: bytearray):
+        """Algorithm 6 - Page 19 (w = 8, k1 = 11, k2 = 13, k3 = 16)"""
+        O0 = O[0]
+        
+        # Shift left (equivalent to copy(O[0:], O[1:12]) in Go)
+        for i in range(11):
+            O[i] = O[i + 1]
+        
+        # Note: In Go, operations are with uint8, so overflow is automatic
+        O[9] = (O[9] ^ O0 ^ (O0 >> 3) ^ (O0 >> 5)) & 0xFF
+        O[10] = (O[10] ^ ((O0 << 5) & 0xFF) ^ ((O0 << 3) & 0xFF)) & 0xFF
+        O[11] = O0
+    
+    def LFSRC(self, m_data: bytes, c_data: bytearray):
+        """Algorithm 8 - Page 20"""
+        m_length = len(m_data)
+        block_bytes = self.block_bytes
+        
+        M = bytearray(block_bytes)
+        C = bytearray(block_bytes)
+        O = bytearray(block_bytes)
+        O[:] = self.R[:]
+        
+        q = m_length // block_bytes
+        r = m_length % block_bytes
+        
+        for i in range(q):
+            M[:] = m_data[i * block_bytes:(i + 1) * block_bytes]
+            self.updateOffset(O)
+            self.cipher.Encrypt(C, bytes(O))
+            self._xor(C, M)
+            c_data[i * block_bytes:(i + 1) * block_bytes] = C[:block_bytes]
+        
+        if r != 0:
+            M[:r] = m_data[q * block_bytes:q * block_bytes + r]
+            for i in range(r, block_bytes):
+                M[i] = 0
+            
+            self.updateOffset(O)
+            self.cipher.Encrypt(C, bytes(O))
+            self._xor(C, M)
+            c_data[q * block_bytes:q * block_bytes + r] = C[:r]
+    
+    def Encrypt(self, dst: bytearray, src: bytes):
+        """Encrypt data"""
+        m_length = len(src)
+        block_bytes = self.block_bytes
+        
+        # Step 3 of Algorithm 2 - Page 6 (C and part of A)
+        self.A = bytearray(block_bytes)
+        self.m_length = m_length
+        
+        # if dst == nil { dst = make([]byte, blockBytes) }
+        if dst is None or len(dst) == 0:
+            dst = bytearray(block_bytes)
+        
+        self.LFSRC(src, dst)
+        
+        self.mac.InitWithR(bytes(self.R))
+        self.mac.Update(bytes(dst))  # CORRIGIDO: SEMPRE chamar Update
+        self.mac.GetTag(self.A, self.cipher.BLOCK_SIZE * 8)
+    
+    def Decrypt(self, dst: bytearray, src: bytes):
+        """Decrypt data"""
+        self.LFSRC(src, dst)
+    
+    def GetTag(self, tag: Optional[bytearray] = None, tag_bits: int = 96):
+        """Get authentication tag"""
+        if tag is None:
+            tag = bytearray(tag_bits // 8)
+        
+        block_bytes = self.block_bytes
+        
+        # Step 3 of Algorithm 2 - Page 6 (completes the part of A due to M)
+        Atemp = bytearray(block_bytes)
+        copy_len = min(len(self.A), block_bytes)
+        Atemp[:copy_len] = self.A[:copy_len]
+        
+        aux_value1 = bytearray(block_bytes)
+        aux_value2 = bytearray(block_bytes)
+        
+        # auxValue1 = rpad(bin(n-tagBits)||1)
+        diff = self.cipher.BLOCK_SIZE * 8 - tag_bits
+        
+        if diff == 0:
+            aux_value1[0] = 0x80
+            aux_value1[1] = 0x00
+        elif diff < 0:
+            aux_value1[0] = diff & 0xFF
+            aux_value1[1] = 0x80
+        else:
+            diff = (diff << 1) | 0x01
+            # Go code does: for diff > 0 { diff = int8(diff << 1) }
+            while diff > 0 and (diff & 0x80) == 0:
+                diff = (diff << 1) & 0xFF
+            aux_value1[0] = diff & 0xFF
+            aux_value1[1] = 0x00
+        
+        # auxValue2 = lpad(bin(|M|))
+        for i in range(4):
+            aux_value2[block_bytes - i - 1] = ((self.m_length * 8) >> (8 * i)) & 0xFF
+        
+        # copy(this.A[0:], Atemp[0:blockBytes]) - in Go, but doesn't seem necessary
+        self._xor(Atemp, aux_value1)
+        self._xor(Atemp, aux_value2)
+        
+        # Steps 4-6 of Algorithm 2 - Page 6 (completes the part of A due to H)
+        # CORRIGIDO: Sempre processar H, mesmo que seja 0
+        # No Go, isso sempre é processado quando L não é nulo
+        if len(self.L) != 0:  # Isso sempre será verdade depois de chamar Update()
+            # auxValue2 = lpad(bin(|H|))
+            aux_value2 = bytearray(block_bytes)
+            for i in range(4):
+                aux_value2[block_bytes - i - 1] = ((self.h_length * 8) >> (8 * i)) & 0xFF
+            
+            Dtemp = bytearray(block_bytes)
+            copy_len = min(len(self.D), block_bytes)
+            Dtemp[:copy_len] = self.D[:copy_len]
+            
+            self._xor(Dtemp, aux_value1)
+            self._xor(Dtemp, aux_value2)
+            self.cipher.Sct(aux_value1, bytes(Dtemp))
+            self._xor(Atemp, aux_value1)
+        
+        # Step 7 of Algorithm 2 - Page 6
+        self.cipher.Encrypt(aux_value1, bytes(Atemp))
+        
+        tag_bytes = tag_bits // 8
+        tag[:tag_bytes] = aux_value1[:tag_bytes]
+        return bytes(tag[:tag_bytes])
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Curupira1 LetterSoup AEAD - Compatible with edgetk',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Encrypt with AAD
+  echo -n "Test" | python curupira1AEAD.py -e -k 0228674ed28f695ed88a39ec --aad metadata
+  
+  # Encrypt without AAD
+  echo -n "Test" | python curupira1AEAD.py -e -k 0228674ed28f695ed88a39ec
+  
+  # Decrypt with edgetk
+  echo -n "Test" | python curupira1AEAD.py -e -k 0228674ed28f695ed88a39ec | \
+    edgetk -crypt dec -cipher curupira -mode lettersoup -key 0228674ed28f695ed88a39ec
+        """
+    )
+    
+    # Operation mode
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument('-e', '--encrypt', action='store_true', 
+                          help='Encrypt input')
+    mode_group.add_argument('-d', '--decrypt', action='store_true', 
+                          help='Decrypt input')
+    mode_group.add_argument('-t', '--test', action='store_true',
+                          help='Run self-test')
+    
+    # Key
+    parser.add_argument('-k', '--key', type=str, required=True,
+                       help='Key as hexadecimal string (12/18/24 bytes)')
+    
+    # AAD
+    parser.add_argument('--aad', type=str, default='',
+                       help='Additional Authenticated Data (AAD)')
+    
+    # Input/Output
+    parser.add_argument('-f', '--file', type=str,
+                       help='Input file (if not specified, reads from stdin)')
+    parser.add_argument('-o', '--output', type=str,
+                       help='Output file (if not specified, writes to stdout)')
+    
+    args = parser.parse_args()
+    
+    if args.test:
+        return run_self_test()
+    
+    try:
+        # Convert key
+        key_hex = args.key.strip().lower()
+        if key_hex.startswith('0x'):
+            key_hex = key_hex[2:]
+        key = bytes.fromhex(key_hex)
+        
+        # Validate key size
+        if len(key) not in [12, 18, 24]:
+            raise ValueError(f"Key must be 12, 18 or 24 bytes, got {len(key)} bytes")
+        
+        # Read input
+        if args.file:
+            with open(args.file, 'rb') as f:
+                input_data = f.read()
+        else:
+            if sys.stdin.isatty():
+                print("Enter input (Ctrl+D to finish):", file=sys.stderr)
+            input_data = sys.stdin.buffer.read()
+        
+        # Create cipher
+        cipher = Curupira1(key)
+        
+        # Create LetterSoup
+        aead = LetterSoup(cipher)
+        
+        # Convert AAD (allow empty AAD)
+        aad = args.aad.encode('utf-8') if args.aad else b''
+        
+        if args.encrypt:
+            # Generate random nonce (12 bytes)
+            nonce = os.urandom(12)
+            
+            # Set IV
+            aead.SetIV(nonce)
+            
+            # Process AAD - SEMPRE chamar Update, mesmo com dados vazios
+            aead.Update(aad)
+            
+            # Encrypt
+            ciphertext = bytearray(len(input_data))
+            aead.Encrypt(ciphertext, input_data)
+            
+            # Get tag
+            tag = aead.GetTag(None, 96)
+            
+            # Output: nonce + tag + ciphertext
+            output = nonce + tag + bytes(ciphertext)
+            
+            if args.output:
+                with open(args.output, 'wb') as f:
+                    f.write(output)
+                print(f"Encryption complete. Output written to {args.output}", file=sys.stderr)
+                print(f"Nonce: {nonce.hex()}", file=sys.stderr)
+                print(f"Tag: {tag.hex()}", file=sys.stderr)
+                print(f"Ciphertext length: {len(ciphertext)} bytes", file=sys.stderr)
+            else:
+                sys.stdout.buffer.write(output)
+            
+        else:  # decrypt
+            # Check minimum size
+            if len(input_data) < 24:
+                raise ValueError("Input too short. Must contain at least 24 bytes (nonce + tag)")
+            
+            # Extract nonce, tag and ciphertext
+            nonce = input_data[:12]
+            tag = input_data[12:24]
+            ciphertext = input_data[24:]
+            
+            # Set IV
+            aead.SetIV(nonce)
+            
+            # Process AAD - SEMPRE chamar Update, mesmo com dados vazios
+            aead.Update(aad)
+            
+            # Decrypt
+            plaintext = bytearray(len(ciphertext))
+            aead.Decrypt(plaintext, ciphertext)
+            
+            # Verify authentication (like edgetk)
+            # Re-encrypt to verify tag
+            test_ciphertext = bytearray(len(plaintext))
+            
+            # Create new instance for verification
+            aead_verify = LetterSoup(cipher)
+            aead_verify.SetIV(nonce)
+            
+            # SEMPRE chamar Update para verificação também
+            aead_verify.Update(aad)
+            
+            aead_verify.Encrypt(test_ciphertext, bytes(plaintext))
+            test_tag = aead_verify.GetTag(None, 96)
+            
+            # Compare tags
+            if tag != test_tag:
+                raise ValueError(f"Authentication failed! Expected tag: {test_tag.hex()}, Received tag: {tag.hex()}")
+            
+            if args.output:
+                with open(args.output, 'wb') as f:
+                    f.write(plaintext)
+                print(f"Decryption complete. Output written to {args.output}", file=sys.stderr)
+            else:
+                sys.stdout.buffer.write(plaintext)
+        
+        return 0
+        
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+def run_self_test():
+    """Run compatibility tests"""
+    print("=== Running compatibility test ===")
+    
+    try:
+        # Test with 12-byte key
+        key = bytes.fromhex("0228674ed28f695ed88a39ec")
+        plaintext = b"Test message for LetterSoup"
+        aad = b"metadata"
+        
+        print(f"Key: {key.hex()}")
+        print(f"Plaintext: {plaintext}")
+        print(f"AAD: {aad}")
+        
+        # Create cipher
+        cipher = Curupira1(key)
+        
+        # Test 1: Basic encryption
+        print("\n1. Encryption test:")
+        aead = LetterSoup(cipher)
+        nonce = b'\x00' * 12  # Fixed nonce for testing
+        
+        aead.SetIV(nonce)
+        aead.Update(aad)
+        
+        ciphertext = bytearray(len(plaintext))
+        aead.Encrypt(ciphertext, plaintext)
+        tag = aead.GetTag(None, 96)
+        
+        print(f"   Nonce: {nonce.hex()}")
+        print(f"   Ciphertext: {bytes(ciphertext).hex()}")
+        print(f"   Tag: {tag.hex()}")
+        
+        # Test 2: Decryption
+        print("\n2. Decryption test:")
+        aead2 = LetterSoup(cipher)
+        aead2.SetIV(nonce)
+        aead2.Update(aad)
+        
+        decrypted = bytearray(len(ciphertext))
+        aead2.Decrypt(decrypted, bytes(ciphertext))
+        
+        print(f"   Decrypted: {bytes(decrypted)}")
+        print(f"   Match: {plaintext == bytes(decrypted)}")
+        
+        # Test 3: Tag verification
+        print("\n3. Tag verification:")
+        aead3 = LetterSoup(cipher)
+        aead3.SetIV(nonce)
+        aead3.Update(aad)
+        
+        test_ciphertext = bytearray(len(decrypted))
+        aead3.Encrypt(test_ciphertext, bytes(decrypted))
+        test_tag = aead3.GetTag(None, 96)
+        
+        print(f"   Calculated tag: {test_tag.hex()}")
+        print(f"   Original tag: {tag.hex()}")
+        print(f"   Tags match: {tag == test_tag}")
+        
+        # Test 4: With random nonce
+        print("\n4. Test with random nonce:")
+        import random
+        random_nonce = bytes([random.randint(0, 255) for _ in range(12)])
+        
+        aead4 = LetterSoup(cipher)
+        aead4.SetIV(random_nonce)
+        aead4.Update(aad)
+        
+        ciphertext4 = bytearray(len(plaintext))
+        aead4.Encrypt(ciphertext4, plaintext)
+        tag4 = aead4.GetTag(None, 96)
+        
+        print(f"   Nonce: {random_nonce.hex()}")
+        print(f"   Tag: {tag4.hex()}")
+        
+        # Test 5: With empty AAD
+        print("\n5. Test with empty AAD:")
+        aead5 = LetterSoup(cipher)
+        aead5.SetIV(random_nonce)
+        aead5.Update(b'')  # AAD vazio
+        
+        ciphertext5 = bytearray(len(plaintext))
+        aead5.Encrypt(ciphertext5, plaintext)
+        tag5 = aead5.GetTag(None, 96)
+        
+        print(f"   Tag (empty AAD): {tag5.hex()}")
+        
+        # Verificar que é diferente do tag com AAD
+        aead6 = LetterSoup(cipher)
+        aead6.SetIV(random_nonce)
+        aead6.Update(b'notempty')
+        
+        ciphertext6 = bytearray(len(plaintext))
+        aead6.Encrypt(ciphertext6, plaintext)
+        tag6 = aead6.GetTag(None, 96)
+        
+        print(f"   Tag (non-empty AAD): {tag6.hex()}")
+        print(f"   Tags are different: {tag5 != tag6}")
+        
+        print("\n=== All tests passed! ===")
+        return 0
+        
+    except Exception as e:
+        print(f"✗ Test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
