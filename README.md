@@ -1,4 +1,4 @@
-# curupira1
+# curupira1 🇧🇷
 Curupira Block Cipher
 
 ### Curupira
