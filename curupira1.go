@@ -1,9 +1,9 @@
 package curupira1
 
 import (
-	"fmt"
 	"crypto/cipher"
-	
+	"fmt"
+
 	"github.com/pedroalbanese/curupira1/internal/subtle"
 )
 
@@ -160,16 +160,16 @@ type AEAD interface {
 }
 
 type LetterSoup struct {
-	mac       MAC
-	cipher    BlockCipher
+	mac        MAC
+	cipher     BlockCipher
 	blockBytes int
-	mLength   int
-	hLength   int
-	iv        []byte
-	A         []byte
-	D         []byte
-	R         []byte
-	L         []byte
+	mLength    int
+	hLength    int
+	iv         []byte
+	A          []byte
+	D          []byte
+	R          []byte
+	L          []byte
 }
 
 func NewLetterSoup(cipher BlockCipher) AEAD {
@@ -575,7 +575,7 @@ func cTimes(u byte) byte {
 		xTimes(
 			xTimes(
 				xTimes(u)^u,
-			)^u,
+			) ^ u,
 		),
 	)
 }
