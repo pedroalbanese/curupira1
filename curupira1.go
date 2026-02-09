@@ -1,9 +1,9 @@
 package curupira1
 
 import (
-	"crypto/cipher"
 	"fmt"
-
+	"crypto/cipher"
+	
 	"github.com/pedroalbanese/curupira1/internal/subtle"
 )
 
@@ -525,7 +525,9 @@ var sBoxTable = [256]byte{0xBA, 0x54, 0x2F, 0x74, 0x53, 0xD3, 0xD2, 0x4D, 0x50, 
 
 // XOR the contents of b into a in-place
 func xor(a, b []byte) {
-	subtle.XORBytes(a, a, b)
+	for i := 0; i < len(a); i++ {
+		a[i] ^= b[i]
+	}
 }
 
 func initXTimesTable() {
