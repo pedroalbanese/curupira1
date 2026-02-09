@@ -12,3 +12,4 @@ $$
 \text{Curupira}[K] \equiv \sigma[\kappa^{(R)}] \circ \pi \circ \gamma \circ \left( \prod_{r=1}^{R-1} \sigma[\kappa^{(r)}] \circ \theta \circ \pi \circ \gamma \right) \circ \sigma[\kappa^{(0)}]
 $$
 
+LetterSoup is a two-pass Authenticated Encryption with Associated Data (AEAD) mode of operation designed for high security and efficiency on resource-constrained platforms, such as wireless sensor networks. It is specifically built upon the [MARVIN](https://www.researchgate.net/publication/227604107_The_MARVIN_message_authentication_code_and_the_LETTERSOUP_authenticated_encryption_scheme) message authentication code (which uses the ALRED construction) and the LFSRC mode of operation.
