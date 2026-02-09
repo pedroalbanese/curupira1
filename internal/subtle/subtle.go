@@ -50,3 +50,18 @@ func InexactOverlap(x, y []byte) bool {
 func ConstantTimeCompare(x, y []byte) int {
 	return subtle.ConstantTimeCompare(x, y)
 }
+
+// No pacote github.com/pedroalbanese/curupira1/internal/subtle
+func XORBytes(dst, x, y []byte) int {
+	n := len(x)
+	if len(y) < n {
+		n = len(y)
+	}
+	if n == 0 {
+		return 0
+	}
+	for i := 0; i < n; i++ {
+		dst[i] = x[i] ^ y[i]
+	}
+	return n
+}
