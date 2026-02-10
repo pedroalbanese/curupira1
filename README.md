@@ -1,6 +1,7 @@
 # Curupira1 🇧🇷
 [![ISC License](http://img.shields.io/badge/license-ISC-blue.svg)](https://github.com/pedroalbanese/curupira1/blob/master/LICENSE.md) 
 [![GoDoc](https://godoc.org/github.com/pedroalbanese/curupira1?status.png)](http://godoc.org/github.com/pedroalbanese/curupira1)
+[![Go Report Card](https://goreportcard.com/badge/github.com/pedroalbanese/curupira1)](https://goreportcard.com/report/github.com/pedroalbanese/curupira1)
 [![GitHub release (latest by date)](https://img.shields.io/github/v/release/pedroalbanese/curupira1)](https://github.com/pedroalbanese/curupira1/releases)
 [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.18570265-blue.svg)](https://doi.org/10.5281/zenodo.18570265)
 
